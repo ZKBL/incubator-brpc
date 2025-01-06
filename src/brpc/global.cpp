@@ -38,6 +38,7 @@
 #include "brpc/policy/remote_file_naming_service.h"
 #include "brpc/policy/consul_naming_service.h"
 #include "brpc/policy/discovery_naming_service.h"
+#include "brpc/policy/nacos_naming_service.h"
 
 // Load Balancers
 #include "brpc/policy/round_robin_load_balancer.h"
@@ -48,6 +49,11 @@
 #include "brpc/policy/consistent_hashing_load_balancer.h"
 #include "brpc/policy/hasher.h"
 #include "brpc/policy/dynpart_load_balancer.h"
+
+
+// Span
+#include "brpc/span.h"
+#include "bthread/unstable.h"
 
 // Compress handlers
 #include "brpc/compress.h"
@@ -79,6 +85,7 @@
 #include "brpc/concurrency_limiter.h"
 #include "brpc/policy/auto_concurrency_limiter.h"
 #include "brpc/policy/constant_concurrency_limiter.h"
+#include "brpc/policy/timeout_concurrency_limiter.h"
 
 #include "brpc/input_messenger.h"     // get_or_new_client_side_messenger
 #include "brpc/socket_map.h"          // SocketMapList
@@ -135,6 +142,7 @@ struct GlobalExtensions {
     RemoteFileNamingService rfns;
     ConsulNamingService cns;
     DiscoveryNamingService dcns;
+    NacosNamingService nns;
 
     RoundRobinLoadBalancer rr_lb;
     WeightedRoundRobinLoadBalancer wrr_lb;
@@ -148,6 +156,7 @@ struct GlobalExtensions {
 
     AutoConcurrencyLimiter auto_cl;
     ConstantConcurrencyLimiter constant_cl;
+    TimeoutConcurrencyLimiter timeout_cl;
 };
 
 static pthread_once_t register_extensions_once = PTHREAD_ONCE_INIT;
@@ -288,6 +297,7 @@ static void* GlobalUpdate(void*) {
     return NULL;
 }
 
+#if GOOGLE_PROTOBUF_VERSION < 3022000
 static void BaiduStreamingLogHandler(google::protobuf::LogLevel level,
                                      const char* filename, int line,
                                      const std::string& message) {
@@ -307,6 +317,7 @@ static void BaiduStreamingLogHandler(google::protobuf::LogLevel level,
     }
     CHECK(false) << filename << ':' << line << ' ' << message;
 }
+#endif
 
 static void GlobalInitializeOrDieImpl() {
     //////////////////////////////////////////////////////////////////
@@ -319,11 +330,16 @@ static void GlobalInitializeOrDieImpl() {
     struct sigaction oldact;
     if (sigaction(SIGPIPE, NULL, &oldact) != 0 ||
             (oldact.sa_handler == NULL && oldact.sa_sigaction == NULL)) {
-        CHECK(NULL == signal(SIGPIPE, SIG_IGN));
+        CHECK(SIG_ERR != signal(SIGPIPE, SIG_IGN));
     }
 
+#if GOOGLE_PROTOBUF_VERSION < 3022000
     // Make GOOGLE_LOG print to comlog device
     SetLogHandler(&BaiduStreamingLogHandler);
+#endif
+
+    // Set bthread create span function
+    bthread_set_create_span_func(CreateBthreadSpan);
 
     // Setting the variable here does not work, the profiler probably check
     // the variable before main() for only once.
@@ -358,6 +374,7 @@ static void GlobalInitializeOrDieImpl() {
     NamingServiceExtension()->RegisterOrDie("remotefile", &g_ext->rfns);
     NamingServiceExtension()->RegisterOrDie("consul", &g_ext->cns);
     NamingServiceExtension()->RegisterOrDie("discovery", &g_ext->dcns);
+    NamingServiceExtension()->RegisterOrDie("nacos", &g_ext->nns);
 
     // Load Balancers
     LoadBalancerExtension()->RegisterOrDie("rr", &g_ext->rr_lb);
@@ -598,7 +615,8 @@ static void GlobalInitializeOrDieImpl() {
     // Concurrency Limiters
     ConcurrencyLimiterExtension()->RegisterOrDie("auto", &g_ext->auto_cl);
     ConcurrencyLimiterExtension()->RegisterOrDie("constant", &g_ext->constant_cl);
-    
+    ConcurrencyLimiterExtension()->RegisterOrDie("timeout", &g_ext->timeout_cl);
+
     if (FLAGS_usercode_in_pthread) {
         // Optional. If channel/server are initialized before main(), this
         // flag may be false at here even if it will be set to true after

@@ -4,7 +4,9 @@
 
 #include "butil/basictypes.h"
 #include "butil/logging.h"
-
+#include "butil/gperftools_profiler.h"
+#include "butil/files/temp_file.h"
+#include "butil/popen.h"
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
 
@@ -13,6 +15,10 @@
 namespace logging {
 DECLARE_bool(crash_on_fatal_log);
 DECLARE_int32(v);
+DECLARE_bool(log_func_name);
+DECLARE_bool(async_log);
+DECLARE_bool(async_log_in_background_always);
+DECLARE_int32(max_async_log_queue_size);
 
 namespace {
 
@@ -344,6 +350,12 @@ TEST_F(LoggingTest, check) {
     CHECK_GE(3, 3);
 }
 
+TEST_F(LoggingTest, log_backtrace) {
+    LOG_BACKTRACE_IF(INFO, true) << "log_backtrace_if";
+    LOG_BACKTRACE_IF_ONCE(INFO, true) << "log_backtrace_if_once";
+    LOG_BACKTRACE_ONCE(INFO) << "log_backtrace_once";
+}
+
 int foo(int* p) {
     return ++*p;
 }
@@ -417,6 +429,219 @@ TEST_F(LoggingTest, limited_logging) {
         VLOG_EVERY_SECOND(1) << "vi4=" << i;
         usleep(10000);
     }
+}
+
+void CheckFunctionName() {
+    const char* func_name = __func__;
+    DCHECK(1) << "test";
+    ASSERT_EQ(func_name, LOG_STREAM(DCHECK).func());
+
+    LOG(DEBUG) << "test" << noflush;
+    ASSERT_EQ(func_name, LOG_STREAM(DEBUG).func());
+    LOG(INFO) << "test" << noflush;
+    ASSERT_EQ(func_name, LOG_STREAM(INFO).func());
+    LOG(WARNING) << "test" << noflush;
+    ASSERT_EQ(func_name, LOG_STREAM(WARNING).func());
+    LOG(WARNING) << "test" << noflush;
+    ASSERT_EQ(func_name, LOG_STREAM(WARNING).func());
+    LOG(ERROR) << "test" << noflush;
+    ASSERT_EQ(func_name, LOG_STREAM(ERROR).func());
+    LOG(FATAL) << "test" << noflush;
+    ASSERT_EQ(func_name, LOG_STREAM(FATAL).func());
+
+    errno = EINTR;
+    PLOG(DEBUG) << "test" << noflush;
+    ASSERT_EQ(func_name, PLOG_STREAM(DEBUG).func());
+    PLOG(INFO) << "test" << noflush;
+    ASSERT_EQ(func_name, PLOG_STREAM(INFO).func());
+    PLOG(WARNING) << "test" << noflush;
+    ASSERT_EQ(func_name, PLOG_STREAM(WARNING).func());
+    PLOG(WARNING) << "test" << noflush;
+    ASSERT_EQ(func_name, PLOG_STREAM(WARNING).func());
+    PLOG(ERROR) << "test" << noflush;
+    ASSERT_EQ(func_name, PLOG_STREAM(ERROR).func());
+    PLOG(FATAL) << "test" << noflush;
+    ASSERT_EQ(func_name, PLOG_STREAM(FATAL).func());
+
+    ::logging::StringSink log_str;
+    ::logging::LogSink* old_sink = ::logging::SetLogSink(&log_str);
+    LOG_AT(WARNING, "specified_file.cc", 12345, "log_at") << "file/line is specified";
+    // the file:line part should be using the argument given by us.
+    ASSERT_NE(std::string::npos, log_str.find("specified_file.cc:12345 log_at"));
+    ::logging::SetLogSink(old_sink);
+
+    EXPECT_FALSE(GFLAGS_NS::SetCommandLineOption("v", "1").empty());
+    VLOG(100) << "test" << noflush;
+    ASSERT_EQ(func_name, VLOG_STREAM(100).func());
+}
+
+TEST_F(LoggingTest, log_func) {
+    bool old_crash_on_fatal_log = ::logging::FLAGS_crash_on_fatal_log;
+    ::logging::FLAGS_crash_on_fatal_log = false;
+
+    ::logging::FLAGS_log_func_name = true;
+    CheckFunctionName();
+    ::logging::FLAGS_log_func_name = false;
+
+    ::logging::FLAGS_crash_on_fatal_log = old_crash_on_fatal_log;
+}
+
+bool g_started = false;
+bool g_stopped = false;
+int g_prof_name_counter = 0;
+butil::atomic<uint64_t> test_logging_count(0);
+
+void* test_async_log(void* arg) {
+    if (arg == NULL) {
+        return NULL;
+    }
+    auto log = (std::string*)(arg);
+    while (!g_stopped) {
+        LOG(INFO) << *log;
+        test_logging_count.fetch_add(1);
+    }
+
+    return NULL;
+}
+
+TEST_F(LoggingTest, async_log) {
+    bool saved_async_log = FLAGS_async_log;
+    FLAGS_async_log = true;
+    butil::TempFile temp_file;
+    LoggingSettings settings;
+    settings.logging_dest = LOG_TO_FILE;
+    settings.log_file = temp_file.fname();
+    settings.delete_old = DELETE_OLD_LOG_FILE;
+    InitLogging(settings);
+
+    std::string log = "135792468";
+    int thread_num = 8;
+    pthread_t threads[thread_num];
+    for (int i = 0; i < thread_num; ++i) {
+        ASSERT_EQ(0, pthread_create(&threads[i], NULL, test_async_log, &log));
+    }
+
+    usleep(1000 * 500);
+
+    g_stopped = true;
+    for (int i = 0; i < thread_num; ++i) {
+        pthread_join(threads[i], NULL);
+    }
+    // Wait for async log thread to flush all logs to file.
+    sleep(15);
+
+    std::ostringstream oss;
+    std::string cmd = butil::string_printf("grep -c %s %s",
+        log.c_str(), temp_file.fname());
+    ASSERT_LE(0, butil::read_command_output(oss, cmd.c_str()));
+    uint64_t log_count = std::strtol(oss.str().c_str(), NULL, 10);
+    ASSERT_EQ(log_count, test_logging_count.load());
+
+    FLAGS_async_log = saved_async_log;
+}
+
+struct BAIDU_CACHELINE_ALIGNMENT PerfArgs {
+    const std::string* log;
+    int64_t counter;
+    int64_t elapse_ns;
+    bool ready;
+
+    PerfArgs() : log(NULL), counter(0), elapse_ns(0), ready(false) {}
+};
+
+void* test_log(void* void_arg) {
+    auto args = (PerfArgs*)void_arg;
+    args->ready = true;
+    butil::Timer t;
+    std::string log = *args->log;
+    int counter = 0;
+    while (!g_stopped) {
+        if (g_started) {
+            break;
+        }
+        usleep(10);
+    }
+    t.start();
+    while (!g_stopped) {
+        {
+            LOG(INFO) << log;
+            test_logging_count.fetch_add(1, butil::memory_order_relaxed);
+        }
+        ++counter;
+    }
+    t.stop();
+    args->elapse_ns = t.n_elapsed();
+    args->counter = counter;
+    return NULL;
+}
+
+void PerfTest(int thread_num, const std::string& log, bool async) {
+    FLAGS_async_log = async;
+
+    g_started = false;
+    g_stopped = false;
+    pthread_t threads[thread_num];
+    std::vector<PerfArgs> args(thread_num);
+    for (int i = 0; i < thread_num; ++i) {
+        args[i].log = &log;
+        ASSERT_EQ(0, pthread_create(&threads[i], NULL, test_log, &args[i]));
+    }
+    while (true) {
+        bool all_ready = true;
+        for (int i = 0; i < thread_num; ++i) {
+            if (!args[i].ready) {
+                all_ready = false;
+                break;
+            }
+        }
+        if (all_ready) {
+            break;
+        }
+        usleep(1000);
+    }
+    int sleep_s = 2;
+    g_started = true;
+    char prof_name[32];
+    snprintf(prof_name, sizeof(prof_name), "logging_%d.prof", ++g_prof_name_counter);
+    ProfilerStart(prof_name);
+    sleep(sleep_s);
+    ProfilerStop();
+    g_stopped = true;
+    int64_t wait_time = 0;
+    int64_t count = 0;
+    for (int i = 0; i < thread_num; ++i) {
+        pthread_join(threads[i], NULL);
+        wait_time += args[i].elapse_ns;
+        count += args[i].counter;
+    }
+    std::cout << " thread_num=" << thread_num
+              << " log_type=" << (async ? "async" : "sync")
+              << " log_size=" << log.size()
+              << " count=" << count
+              << " duration=" << sleep_s << "s"
+              << " qps=" << (int)(count / (double)sleep_s)
+              << " average_time=" << wait_time / (double)count << "us"
+              << std::endl;
+}
+
+TEST_F(LoggingTest, performance) {
+    bool saved_async_log = FLAGS_async_log;
+    FLAGS_max_async_log_queue_size =
+        std::numeric_limits<int32_t>::max();
+    FLAGS_async_log_in_background_always = true;
+
+    LoggingSettings settings;
+    settings.logging_dest = LOG_TO_FILE;
+    settings.delete_old = DELETE_OLD_LOG_FILE;
+    InitLogging(settings);
+    std::string log(100, 'a');
+    PerfTest(1, log, false);
+    PerfTest(8, log, false);
+    PerfTest(1, log, true);
+    sleep(10);
+    PerfTest(8, log, true);
+
+    FLAGS_async_log = saved_async_log;
 }
 
 }  // namespace

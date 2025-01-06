@@ -16,11 +16,22 @@
 // under the License.
 
 #include <gtest/gtest.h>
+#include <butil/fd_guard.h>
+#include <butil/fd_utility.h>
 #include "butil/errno.h"
 #include "butil/endpoint.h"
 #include "butil/logging.h"
 #include "butil/containers/flat_map.h"
 #include "butil/details/extended_endpoint.hpp"
+#include <netinet/tcp.h>
+#if defined(OS_MACOSX)
+#include <netinet/tcp_fsm.h>
+#endif
+
+namespace butil {
+int pthread_timed_connect(int sockfd, const struct sockaddr* serv_addr,
+                          socklen_t addrlen, const timespec* abstime);
+}
 
 namespace {
 
@@ -156,9 +167,6 @@ void* server_proc(void* arg) {
     sockaddr_storage ss;
     socklen_t len = sizeof(ss);
     int fd = accept(listen_fd, (sockaddr*)&ss, &len);
-    if (fd > 0) {
-        close(fd);
-    }
     return (void*)(int64_t)fd;
 }
 
@@ -190,7 +198,9 @@ static void test_listen_connect(const std::string& server_addr, const std::strin
 
     void* ret = nullptr;
     pthread_join(pid, &ret);
-    ASSERT_GT((int64_t)ret, 0);
+    int server_fd = (int)(int64_t)ret;
+    ASSERT_GT(server_fd, 0);
+    close(server_fd);
     close(listen_fd);
 }
 
@@ -238,12 +248,12 @@ TEST(EndPointTest, unix_socket) {
     ASSERT_EQ(0, butil::str2endpoint("unix://a.sock", 123, &point));
     ASSERT_EQ(std::string("unix://a.sock"), butil::endpoint2str(point).c_str());
 
-    ASSERT_EQ(-1, butil::str2endpoint("unix:tooloooooooooooooooooooooooooooooooooooooooooooooooooo"
-        "ooooooooooooooooooooooooooooooooooooooooooooooong.sock", &point));
-    ASSERT_EQ(0, butil::str2endpoint(" unix:loooooooooooooooooooooooooooooooooooooooooooooooooooo"
-        "ooooooooooooooooooooooooooooooooooooooooooooooong.sock", &point));
-    ASSERT_EQ(std::string("unix:loooooooooooooooooooooooooooooooooooooooooooooooooooo"
-        "ooooooooooooooooooooooooooooooooooooooooooooooong.sock"), butil::endpoint2str(point).c_str());
+    std::string long_path = "unix:";
+    long_path.append(sizeof(sockaddr_un::sun_path) - 1, 'a');
+    ASSERT_EQ(0, butil::str2endpoint(long_path.c_str(), &point));
+    ASSERT_EQ(long_path, butil::endpoint2str(point).c_str());
+    long_path.push_back('a');
+    ASSERT_EQ(-1, butil::str2endpoint(long_path.c_str(), &point));
     char buf[128] = {0}; // braft use this size of buffer
     size_t ret = snprintf(buf, sizeof(buf), "%s:%d", butil::endpoint2str(point).c_str(), INT_MAX);
     ASSERT_LT(ret, sizeof(buf) - 1);
@@ -383,9 +393,7 @@ TEST(EndPointTest, endpoint_sockaddr_conv_ipv6) {
 
     in6_addr expect_in6_addr;
     bzero(&expect_in6_addr, sizeof(expect_in6_addr));
-    expect_in6_addr.__in6_u.__u6_addr8[15] = 1;
-    // jge: mac monterey上应该这样，但准确判定条件不明
-    //expect_in6_addr.__u6_addr.__u6_addr8[15] = 1;
+    expect_in6_addr.s6_addr[15] = 1;
 
     sockaddr_storage ss;
     const sockaddr_in6* sa6 = (sockaddr_in6*) &ss;
@@ -473,6 +481,119 @@ TEST(EndPointTest, endpoint_concurrency) {
         pthread_join(tids[i], nullptr);
         ASSERT_EQ(1, rets[i]);
     }
+}
+
+const char* g_hostname = "baidu.com";
+
+TEST(EndPointTest, tcp_connect) {
+    butil::EndPoint ep;
+    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname, 80, &ep));
+    {
+        butil::fd_guard sockfd(butil::tcp_connect(ep, NULL));
+        ASSERT_LE(0, sockfd) << "errno=" << errno;
+    }
+    {
+        butil::fd_guard sockfd(butil::tcp_connect(ep, NULL, 1000));
+        ASSERT_LE(0, sockfd) << "errno=" << errno;
+    }
+    {
+        butil::fd_guard sockfd(butil::tcp_connect(ep, NULL, 1));
+        ASSERT_EQ(-1, sockfd) << "errno=" << errno;
+        ASSERT_EQ(ETIMEDOUT, errno);
+    }
+
+    {
+        struct sockaddr_storage serv_addr{};
+        socklen_t serv_addr_size = 0;
+        ASSERT_EQ(0, endpoint2sockaddr(ep, &serv_addr, &serv_addr_size));
+        butil::fd_guard sockfd(socket(serv_addr.ss_family, SOCK_STREAM, 0));
+        ASSERT_LE(0, sockfd);
+        bool is_blocking = butil::is_blocking(sockfd);
+        ASSERT_EQ(0, butil::pthread_timed_connect(
+            sockfd, (struct sockaddr*) &serv_addr, serv_addr_size, NULL));
+        ASSERT_EQ(is_blocking, butil::is_blocking(sockfd));
+    }
+
+    {
+        struct sockaddr_storage serv_addr{};
+        socklen_t serv_addr_size = 0;
+        ASSERT_EQ(0, endpoint2sockaddr(ep, &serv_addr, &serv_addr_size));
+        butil::fd_guard sockfd(socket(serv_addr.ss_family, SOCK_STREAM, 0));
+        ASSERT_LE(0, sockfd);
+        bool is_blocking = butil::is_blocking(sockfd);
+        // In most cases, 1 millisecond will result in a connection timeout.
+        timespec abstime = butil::milliseconds_from_now(1);
+        const int rc = butil::pthread_timed_connect(
+            sockfd, (struct sockaddr*) &serv_addr,
+            serv_addr_size, &abstime);
+        ASSERT_EQ(-1, rc);
+        ASSERT_EQ(ETIMEDOUT, errno);
+        ASSERT_EQ(is_blocking, butil::is_blocking(sockfd));
+    }
+}
+
+bool g_connect_startd = false;
+
+void TestConnectInterruptImpl(bool timed) {
+    butil::EndPoint ep;
+    ASSERT_EQ(0, butil::hostname2endpoint(g_hostname, 80, &ep));
+
+    struct sockaddr_storage serv_addr{};
+    socklen_t serv_addr_size = 0;
+    ASSERT_EQ(0, endpoint2sockaddr(ep, &serv_addr, &serv_addr_size));
+    butil::fd_guard sockfd(socket(serv_addr.ss_family, SOCK_STREAM, 0));
+    ASSERT_LE(0, sockfd);
+
+    int rc;
+    if (timed) {
+        int64_t start_ms = butil::cpuwide_time_ms();
+        butil::tcp_connect(ep, NULL);
+        int64_t connect_ms = butil::cpuwide_time_ms() - start_ms;
+        LOG(INFO) << "Connect to " << ep << ", cost " << connect_ms << "ms";
+
+        timespec abstime = butil::milliseconds_from_now(connect_ms * 2);
+        rc = butil::pthread_timed_connect(
+            sockfd, (struct sockaddr*) &serv_addr,
+            serv_addr_size, &abstime);
+    } else {
+        rc = butil::pthread_timed_connect(
+            sockfd, (struct sockaddr*) &serv_addr,
+            serv_addr_size, NULL);
+    }
+    ASSERT_EQ(0, rc) << "errno=" << errno;
+    ASSERT_EQ(0, butil::is_connected(sockfd));
+}
+
+void* ConnectThread(void* arg) {
+    bool timed = *(bool*)arg;
+    TestConnectInterruptImpl(timed);
+    return NULL;
+}
+
+void do_nothing_handler(int) {}
+
+void register_sigurg() {
+    signal(SIGURG, do_nothing_handler);
+}
+
+void TestConnectInterrupt(bool timed) {
+    g_connect_startd = false;
+    pthread_t tid;
+    ASSERT_EQ(0, pthread_create(&tid, NULL, ConnectThread, &timed));
+
+    while (g_connect_startd) {
+        usleep(1000);
+    }
+
+    ASSERT_EQ(0, pthread_kill(tid, SIGURG));
+
+    pthread_join(tid, NULL);
+}
+
+TEST(EndPointTest, interrupt) {
+    register_sigurg();
+    TestConnectInterrupt(false);
+    TestConnectInterrupt(true);
 }
 
 } // end of namespace

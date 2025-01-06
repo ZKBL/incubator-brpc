@@ -80,11 +80,17 @@ struct SocketMapKeyHasher {
 // successfully, SocketMapRemove() MUST be called when the Socket is not needed.
 // Return 0 on success, -1 otherwise.
 int SocketMapInsert(const SocketMapKey& key, SocketId* id,
-                    const std::shared_ptr<SocketSSLContext>& ssl_ctx);
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+                    bool use_rdma);
+
+inline int SocketMapInsert(const SocketMapKey& key, SocketId* id,
+                    const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
+    return SocketMapInsert(key, id, ssl_ctx, false);
+}
 
 inline int SocketMapInsert(const SocketMapKey& key, SocketId* id) {
     std::shared_ptr<SocketSSLContext> empty_ptr;
-    return SocketMapInsert(key, id, empty_ptr);
+    return SocketMapInsert(key, id, empty_ptr, false);
 }
 
 // Find the SocketId associated with `key'.
@@ -144,10 +150,15 @@ public:
     ~SocketMap();
     int Init(const SocketMapOptions&);
     int Insert(const SocketMapKey& key, SocketId* id,
-               const std::shared_ptr<SocketSSLContext>& ssl_ctx);
+               const std::shared_ptr<SocketSSLContext>& ssl_ctx,
+               bool use_rdma);
+    int Insert(const SocketMapKey& key, SocketId* id,
+               const std::shared_ptr<SocketSSLContext>& ssl_ctx) {
+        return Insert(key, id, ssl_ctx, false);   
+    }
     int Insert(const SocketMapKey& key, SocketId* id) {
         std::shared_ptr<SocketSSLContext> empty_ptr;
-        return Insert(key, id, empty_ptr);
+        return Insert(key, id, empty_ptr, false);
     }
 
     void Remove(const SocketMapKey& key, SocketId expected_id);
@@ -164,6 +175,7 @@ private:
     static void* RunWatchConnections(void*);
     void Print(std::ostream& os);
     static void PrintSocketMap(std::ostream& os, void* arg);
+    void ShowSocketMapInBvarIfNeed();
 
 private:
     struct SingleConnection {
@@ -179,7 +191,7 @@ private:
     SocketMapOptions _options;
     butil::Mutex _mutex;
     Map _map;
-    bool _exposed_in_bvar;
+    butil::atomic<bool> _exposed_in_bvar;
     bvar::PassiveStatus<std::string>* _this_map_bvar;
     bool _has_close_idle_thread;
     bthread_t _close_idle_thread;

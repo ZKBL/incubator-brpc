@@ -46,6 +46,13 @@ public:
                           int /*column*/, const std::string& message) {
         LOG_AT(ERROR, filename.c_str(), line) << message;
     }
+
+#if GOOGLE_PROTOBUF_VERSION >= 5026000
+    void RecordError(absl::string_view filename, int line, int column,
+                     absl::string_view message) override {
+        LOG_AT(ERROR, filename.data(), line) << message;
+    }
+#endif
 };
 
 int PressClient::init() {
@@ -222,7 +229,7 @@ void RpcPress::sync_client() {
     int64_t last_expected_time = butil::monotonic_time_ns();
     const int64_t interval = (int64_t) (1000000000L / req_rate);
     // the max tolerant delay between end_time and expected_time. 10ms or 10 intervals
-    int64_t max_tolerant_delay = std::max(10000000L, 10 * interval);    
+    int64_t max_tolerant_delay = std::max((int64_t) 10000000L, 10 * interval);    
     while (!_stop) {
         brpc::Controller* cntl = new brpc::Controller;
         msg_index = (msg_index + _options.test_thread_num) % _msgs.size();
