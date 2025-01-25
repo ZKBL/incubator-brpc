@@ -16,6 +16,7 @@ brpc有如下依赖：
 * [Fedora/CentOS](#fedoracentos)
 * [自己构建依赖的Linux](#自己构建依赖的Linux)
 * [MacOS](#macos)
+* [docker](#docker)
 
 ## Ubuntu/LinuxMint/WSL
 ### 依赖准备
@@ -30,14 +31,24 @@ sudo apt-get install -y git g++ make libssl-dev libgflags-dev libprotobuf-dev li
 sudo apt-get install -y libsnappy-dev
 ```
 
+如果你需要通过源码编译生成 leveldb 静态库：
+
+```shell
+git clone --recurse-submodules https://github.com/google/leveldb.git
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON .. && cmake --build .
+sudo cp -r ../include/leveldb /usr/include/ && sudo cp libleveldb.a /usr/lib/
+```
+
 如果你要在样例中启用cpu/heap的profiler：
+
 ```shell
 sudo apt-get install -y libgoogle-perftools-dev
 ```
 
 如果你要运行测试，那么要安装并编译libgtest-dev（它没有被默认编译）：
 ```shell
-sudo apt-get install -y cmake libgtest-dev && cd /usr/src/gtest && sudo cmake . && sudo make && sudo mv libgtest* /usr/lib/ && cd -
+sudo apt-get install -y cmake libgtest-dev && cd /usr/src/gtest && sudo cmake . && sudo make && sudo mv lib/libgtest* /usr/lib/ && cd -
 ```
 gtest源码目录可能变动，如果`/usr/src/gtest`不存在，请尝试`/usr/src/googletest/googletest`。
 
@@ -97,6 +108,7 @@ cmake -B build && cmake --build build -j6
 ```shell
 $ cd example/echo_c++
 $ cmake -B build && cmake --build build -j4
+$ cd build
 $ ./echo_server &
 $ ./echo_client
 ```
@@ -170,6 +182,17 @@ $ sh run_tests.sh
 ### 使用cmake编译brpc
 参考[这里](#使用cmake编译brpc)
 
+### 使用vcpkg编译brpc
+
+[vcpkg](https://github.com/microsoft/vcpkg) 是一个全平台支持的包管理器，你可以使用以下步骤vcpkg轻松编译brpc:
+
+```shell
+$ git clone https://github.com/microsoft/vcpkg.git
+$ ./bootstrap-vcpkg.bat # 使用 powershell
+$ ./bootstrap-vcpkg.sh # 使用 bash
+$ ./vcpkg install brpc
+```
+
 ## 自己构建依赖的Linux
 
 ### 依赖准备
@@ -226,7 +249,8 @@ master HEAD已支持M1系列芯片，M2未测试过。欢迎通过issues向我�
 
 安装依赖：
 ```shell
-brew install openssl git gnu-getopt coreutils gflags protobuf leveldb
+brew install ./homebrew-formula/protobuf.rb
+brew install openssl git gnu-getopt coreutils gflags leveldb
 ```
 
 如果你要在样例中启用cpu/heap的profiler：
@@ -243,7 +267,7 @@ git clone https://github.com/google/googletest -b release-1.10.0 && cd googletes
 ### OpenSSL
 Monterey中openssl的安装位置可能不再位于`/usr/local/opt/openssl`，很可能会在`/opt/homebrew/Cellar`目录下，如果编译时报告找不到openssl：
 
-* 先运行`brew link openssl --force`看看`/user/local/opt/openssl`是否出现了
+* 先运行`brew link openssl --force`看看`/usr/local/opt/openssl`是否出现了
 * 没有的话可以自行设置软链：`sudo ln -s /opt/homebrew/Cellar/openssl@3/3.0.3 /usr/local/opt/openssl`。请注意此命令中openssl的目录可能随环境变化而变化，可通过`brew info openssl`查看。
 
 ### 使用config_brpc.sh编译brpc
@@ -285,17 +309,34 @@ $ sh run_tests.sh
 ### 使用cmake编译brpc
 参考[这里](#使用cmake编译brpc)
 
+## Docker
+使用docker 编译brpc：
+
+```shell
+$ mkdir -p ~/brpc
+$ cd ~/brpc
+$ git clone https://github.com/apache/brpc.git
+$ cd brpc
+$ docker build -t brpc:master .
+$ docker images
+$ docker run -it brpc:master /bin/bash
+```
+
 # 支持的依赖
 
-## GCC: 4.8-7.1
+## GCC: 4.8-11.2
 
-c++11被默认启用，以去除去boost的依赖（比如atomic）。
+**推荐 8.2 及以上版本。**
+
+默认启用 c++11，以去除对 boost 的依赖（比如 atomic）。
+
+理论支持 c++11 的编译器都应可以，但部分编译器版本对 c++11 的支持存在问题。目前 GCC 4.8 可支持编译的最高版本为 1.5.0。
 
 GCC7中over-aligned的问题暂时被禁止。
 
 使用其他版本的gcc可能会产生编译警告，请联系我们予以修复。
 
-请在makefile中给cxxflags增加`-D__const__=`选项以避免[gcc4+中的errno问题](thread_local.md).
+请在makefile中给cxxflags增加`-D__const__=__unused__`选项以避免[gcc4+中的errno问题](thread_local.md).
 
 ## Clang: 3.5-4.0
 
@@ -305,17 +346,17 @@ GCC7中over-aligned的问题暂时被禁止。
 
 无已知问题。
 
-## protobuf: 2.4+
+## protobuf: 3.0-5.29
 
-同一个文件兼容pb 3.x版本和pb 2.x版本：
-不要使用proto3新增的类型，并且在proto文件的起始位置添加`syntax=proto2;`声明。
-[tools/add_syntax_equal_proto2_to_all.sh](https://github.com/brpc/brpc/blob/master/tools/add_syntax_equal_proto2_to_all.sh)这个脚本可以给所有没有这行声明的proto文件添加`syntax="proto2"`声明。
+bRPC 中使用了 protobuf 内部 API，上游不保证相关 API 的兼容性，目前测试可以支持到 v29(5.29)，如有问题欢迎[反馈](https://github.com/apache/brpc/issues)。
+
+[1.8.0](https://github.com/apache/brpc/releases/tag/1.8.0) 中 [#2406](https://github.com/apache/brpc/pull/2406) 和 [#2493](https://github.com/apache/brpc/pull/2493)引入了部分 proto3 语法，所以目前 bRPC 不再兼容 protobuf 2.x 版本。如果你希望使用 2.x 版本，可以使用 1.8.0 之前的 bRPC 版本。
 
 pb 3.x中的Arena至今没被支持。
 
-## gflags: 2.0-2.2.1
+## gflags: 2.1-2.2.2
 
-无已知问题。
+2.1.1 中存在一处已知问题，需要[补丁](https://github.com/gflags/gflags/commit/408061b46974cc8377a8a794a048ecae359ad887)。
 
 ## openssl: 0.97-1.1
 
@@ -341,7 +382,7 @@ brpc默认**不**链接 [tcmalloc](http://goog-perftools.sourceforge.net/doc/tcm
 
 ## glog: 3.3+
 
-brpc实现了一个默认的[日志功能](../../src/butil/logging.h)它和glog冲突。要替换成glog，可以给config_brpc.sh增加*--with-glog*选项或者给cmake增加`-DWITH_GLOG=ON`选项。
+brpc实现了一个默认的[日志功能](../../src/butil/logging.h)它和glog冲突。要替换成glog，可以给config_brpc.sh增加`--with-glog`选项或者给cmake增加`-DWITH_GLOG=ON`选项。
 
 ## valgrind: 3.8+
 
@@ -351,6 +392,12 @@ brpc会自动检测valgrind（然后注册bthread的栈）。不支持老版本�
 
 无已知问题。
 
+## libunwind: 1.3-1.8.1
+
+bRPC默认**不**链接 [libunwind](https://github.com/libunwind/libunwind)。用户需要追踪bthread功能则链接libunwind，可以给config_brpc.sh增加`--with-bthread-tracer`选项或者给cmake增加`-DWITH_BTHREAD_TRACER=ON`选项。
+
+建议使用最新版本的libunwind。
+
 # 实例追踪
 
-我们提供了一个程序去帮助你追踪和监控所有brpc实例。 只需要在某处运行 [trackme_server](https://github.com/brpc/brpc/tree/master/tools/trackme_server/) 然后再带着 -trackme_server=SERVER参数启动需要被追踪的实例。trackme_server将从实例周期性地收到ping消息然后打印日志。您可以从日志中聚合实例地址，并调用实例的内置服务以获取更多信息。
+我们提供了一个程序去帮助你追踪和监控所有brpc实例。 只需要在某处运行 [trackme_server](https://github.com/apache/brpc/tree/master/tools/trackme_server/) 然后再带着 -trackme_server=SERVER参数启动需要被追踪的实例。trackme_server将从实例周期性地收到ping消息然后打印日志。您可以从日志中聚合实例地址，并调用实例的内置服务以获取更多信息。

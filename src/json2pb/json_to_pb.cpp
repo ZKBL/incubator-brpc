@@ -275,7 +275,9 @@ inline bool convert_uint64_type(const BUTIL_RAPIDJSON_NAMESPACE::Value& item,
 
 bool JsonValueToProtoMessage(const BUTIL_RAPIDJSON_NAMESPACE::Value& json_value,
                              google::protobuf::Message* message,
-                             const Json2PbOptions& options, std::string* err);
+                             const Json2PbOptions& options,
+                             std::string* err,
+                             bool root_val = false);
 
 //Json value to protobuf convert rules for type:
 //Json value type                 Protobuf type                convert rules
@@ -516,9 +518,11 @@ bool JsonMapToProtoMap(const BUTIL_RAPIDJSON_NAMESPACE::Value& value,
 bool JsonValueToProtoMessage(const BUTIL_RAPIDJSON_NAMESPACE::Value& json_value,
                              google::protobuf::Message* message,
                              const Json2PbOptions& options,
-                             std::string* err) {
+                             std::string* err,
+                             bool root_val) {
     const google::protobuf::Descriptor* descriptor = message->GetDescriptor();
-    if (!json_value.IsObject() && !(json_value.IsArray() && options.array_to_single_repeated)) {
+    if (!json_value.IsObject() &&
+        !(json_value.IsArray() && options.array_to_single_repeated && root_val)) {
         J2PERROR_WITH_PB(message, err, "The input is not a json object");
         return false;
     }
@@ -530,8 +534,12 @@ bool JsonValueToProtoMessage(const BUTIL_RAPIDJSON_NAMESPACE::Value& json_value,
     for (int i = 0; i < descriptor->extension_range_count(); ++i) {
         const google::protobuf::Descriptor::ExtensionRange*
             ext_range = descriptor->extension_range(i);
-        for (int tag_number = ext_range->start; tag_number < ext_range->end;
-             ++tag_number) {
+#if GOOGLE_PROTOBUF_VERSION < 4025000
+        for (int tag_number = ext_range->start; tag_number < ext_range->end; ++tag_number)
+#else
+        for (int tag_number = ext_range->start_number(); tag_number < ext_range->end_number(); ++tag_number)
+#endif
+        {
             const google::protobuf::FieldDescriptor* field =
                 reflection->FindKnownExtensionByNumber(tag_number);
             if (field) {
@@ -627,7 +635,7 @@ inline bool JsonToProtoMessageInline(const std::string& json_string,
         J2PERROR_WITH_PB(message, error, "Invalid json: %s", BUTIL_RAPIDJSON_NAMESPACE::GetParseError_En(d.GetParseError()));
         return false;
     }
-    return JsonValueToProtoMessage(d, message, options, error);
+    return JsonValueToProtoMessage(d, message, options, error, true);
 }
 
 bool JsonToProtoMessage(const std::string& json_string,
@@ -675,7 +683,7 @@ bool JsonToProtoMessage(ZeroCopyStreamReader* reader,
         J2PERROR_WITH_PB(message, error, "Invalid json: %s", BUTIL_RAPIDJSON_NAMESPACE::GetParseError_En(d.GetParseError()));
         return false;
     }
-    return JsonValueToProtoMessage(d, message, options, error);
+    return JsonValueToProtoMessage(d, message, options, error, true);
 }
 
 bool JsonToProtoMessage(const std::string& json_string, 

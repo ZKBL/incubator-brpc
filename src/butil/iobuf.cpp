@@ -19,6 +19,8 @@
 
 // Date: Thu Nov 22 13:57:56 CST 2012
 
+#include "butil/ssl_compat.h"               // BIO_fd_non_fatal_error
+#include <openssl/err.h>
 #include <openssl/ssl.h>                   // SSL_*
 #ifdef USE_MESALINK
 #include <mesalink/openssl/ssl.h>
@@ -36,6 +38,7 @@
 #include "butil/logging.h"                  // CHECK, LOG
 #include "butil/fd_guard.h"                 // butil::fd_guard
 #include "butil/iobuf.h"
+#include "butil/iobuf_profiler.h"
 
 namespace butil {
 namespace iobuf {
@@ -100,14 +103,14 @@ static ssize_t sys_pwritev(int fd, const struct iovec *vector,
 }
 
 inline iov_function get_preadv_func() {
+#if defined(OS_MACOSX)
+    return user_preadv;
+#endif
     butil::fd_guard fd(open("/dev/zero", O_RDONLY));
     if (fd < 0) {
         PLOG(WARNING) << "Fail to open /dev/zero";
         return user_preadv;
     }
-#if defined(OS_MACOSX)
-    return user_preadv;
-#endif
     char dummy[1];
     iovec vec = { dummy, sizeof(dummy) };
     const int rc = syscall(SYS_preadv, (int)fd, &vec, 1, 0);
@@ -141,8 +144,7 @@ inline iov_function get_pwritev_func() {
 
 #else   // ARCH_CPU_X86_64
 
-#warning "We don't check whether the kernel supports SYS_preadv or SYS_pwritev " \
-         "when the arch is not X86_64, use user space preadv/pwritev directly"
+#warning "We don't check if the kernel supports SYS_preadv or SYS_pwritev on non-X86_64, use implementation on pread/pwrite directly."
 
 inline iov_function get_preadv_func() {
     return user_preadv;
@@ -154,7 +156,7 @@ inline iov_function get_pwritev_func() {
 
 #endif  // ARCH_CPU_X86_64
 
-inline void* cp(void *__restrict dest, const void *__restrict src, size_t n) {
+void* cp(void *__restrict dest, const void *__restrict src, size_t n) {
     // memcpy in gcc 4.8 seems to be faster enough.
     return memcpy(dest, src, n);
 }
@@ -163,8 +165,13 @@ inline void* cp(void *__restrict dest, const void *__restrict src, size_t n) {
 void* (*blockmem_allocate)(size_t) = ::malloc;
 void  (*blockmem_deallocate)(void*) = ::free;
 
+void remove_tls_block_chain();
+
 // Use default function pointers
 void reset_blockmem_allocate_and_deallocate() {
+    // There maybe block allocated by previous hooks, it's wrong to free them using
+    // mismatched hook.
+    remove_tls_block_chain();
     blockmem_allocate = ::malloc;
     blockmem_deallocate = ::free;
 }
@@ -187,8 +194,9 @@ size_t IOBuf::new_bigview_count() {
     return iobuf::g_newbigview.load(butil::memory_order_relaxed);
 }
 
-const uint16_t IOBUF_BLOCK_FLAGS_USER_DATA = 0x1;
-typedef void (*UserDataDeleter)(void*);
+const uint16_t IOBUF_BLOCK_FLAGS_USER_DATA = 1 << 0;
+const uint16_t IOBUF_BLOCK_FLAGS_SAMPLED = 1 << 1;
+using UserDataDeleter = std::function<void(void*)>;
 
 struct UserDataExtension {
     UserDataDeleter deleter;
@@ -200,7 +208,12 @@ struct IOBuf::Block {
     uint16_t abi_check;  // original cap, never be zero.
     uint32_t size;
     uint32_t cap;
-    Block* portal_next;
+    // When flag is 0, portal_next is valid.
+    // When flag & IOBUF_BLOCK_FLAGS_USER_DATA is non-0, data_meta is valid.
+    union {
+        Block* portal_next;
+        uint64_t data_meta;
+    } u;
     // When flag is 0, data points to `size` bytes starting at `(char*)this+sizeof(Block)'
     // When flag & IOBUF_BLOCK_FLAGS_USER_DATA is non-0, data points to the user data and
     // the deleter is put in UserDataExtension at `(char*)this+sizeof(Block)'
@@ -212,11 +225,14 @@ struct IOBuf::Block {
         , abi_check(0)
         , size(0)
         , cap(data_size)
-        , portal_next(NULL)
+        , u({NULL})
         , data(data_in) {
         iobuf::g_nblock.fetch_add(1, butil::memory_order_relaxed);
         iobuf::g_blockmem.fetch_add(data_size + sizeof(Block),
                                     butil::memory_order_relaxed);
+        if (is_samplable()) {
+            SubmitIOBufSample(this, 1);
+        }
     }
 
     Block(char* data_in, uint32_t data_size, UserDataDeleter deleter)
@@ -225,9 +241,13 @@ struct IOBuf::Block {
         , abi_check(0)
         , size(data_size)
         , cap(data_size)
-        , portal_next(NULL)
+        , u({0})
         , data(data_in) {
-        get_user_data_extension()->deleter = deleter;
+        auto ext = new (get_user_data_extension()) UserDataExtension();
+        ext->deleter = std::move(deleter);
+        if (is_samplable()) {
+            SubmitIOBufSample(this, 1);
+        }
     }
 
     // Undefined behavior when (flags & IOBUF_BLOCK_FLAGS_USER_DATA) is 0.
@@ -248,20 +268,28 @@ struct IOBuf::Block {
     void inc_ref() {
         check_abi();
         nshared.fetch_add(1, butil::memory_order_relaxed);
+        if (sampled()) {
+            SubmitIOBufSample(this, 1);
+        }
     }
         
     void dec_ref() {
         check_abi();
+        if (sampled()) {
+            SubmitIOBufSample(this, -1);
+        }
         if (nshared.fetch_sub(1, butil::memory_order_release) == 1) {
             butil::atomic_thread_fence(butil::memory_order_acquire);
-            if (!flags) {
+            if (!is_user_data()) {
                 iobuf::g_nblock.fetch_sub(1, butil::memory_order_relaxed);
                 iobuf::g_blockmem.fetch_sub(cap + sizeof(Block),
                                             butil::memory_order_relaxed);
                 this->~Block();
                 iobuf::blockmem_deallocate(this);
             } else if (flags & IOBUF_BLOCK_FLAGS_USER_DATA) {
-                get_user_data_extension()->deleter(data);
+                auto ext = get_user_data_extension();
+                ext->deleter(data);
+                ext->~UserDataExtension();
                 this->~Block();
                 free(this);
             }
@@ -274,6 +302,23 @@ struct IOBuf::Block {
 
     bool full() const { return size >= cap; }
     size_t left_space() const { return cap - size; }
+
+private:
+    bool is_samplable() {
+        if (IsIOBufProfilerSamplable()) {
+            flags |= IOBUF_BLOCK_FLAGS_SAMPLED;
+            return true;
+        }
+        return false;
+    }
+
+    bool sampled() const {
+        return flags & IOBUF_BLOCK_FLAGS_SAMPLED;
+    }
+
+    bool is_user_data() const {
+        return flags & IOBUF_BLOCK_FLAGS_USER_DATA;
+    }
 };
 
 namespace iobuf {
@@ -282,7 +327,7 @@ namespace iobuf {
 int block_shared_count(IOBuf::Block const* b) { return b->ref_count(); }
 
 IOBuf::Block* get_portal_next(IOBuf::Block const* b) {
-    return b->portal_next;
+    return b->u.portal_next;
 }
 
 uint32_t block_cap(IOBuf::Block const* b) {
@@ -314,6 +359,11 @@ inline IOBuf::Block* create_block() {
 // Max number of blocks in each TLS. This is a soft limit namely
 // release_tls_block_chain() may exceed this limit sometimes.
 const int MAX_BLOCKS_PER_THREAD = 8;
+
+inline int max_blocks_per_thread() {
+    // If IOBufProfiler is enabled, do not cache blocks in TLS.
+    return IsIOBufProfilerEnabled() ? 0 : MAX_BLOCKS_PER_THREAD;
+}
 
 struct TLSData {
     // Head of the TLS block chain.
@@ -347,7 +397,7 @@ void remove_tls_block_chain() {
     tls_data.block_head = NULL;
     int n = 0;
     do {
-        IOBuf::Block* const saved_next = b->portal_next;
+        IOBuf::Block* const saved_next = b->u.portal_next;
         b->dec_ref();
         b = saved_next;
         ++n;
@@ -368,7 +418,7 @@ IOBuf::Block* share_tls_block() {
     if (b) {
         new_block = b;
         while (new_block && new_block->full()) {
-            IOBuf::Block* const saved_next = new_block->portal_next;
+            IOBuf::Block* const saved_next = new_block->u.portal_next;
             new_block->dec_ref();
             --tls_data.num_blocks;
             new_block = saved_next;
@@ -389,18 +439,18 @@ IOBuf::Block* share_tls_block() {
 }
 
 // Return one block to TLS.
-inline void release_tls_block(IOBuf::Block *b) {
+inline void release_tls_block(IOBuf::Block* b) {
     if (!b) {
         return;
     }
     TLSData& tls_data = g_tls_data;
     if (b->full()) {
         b->dec_ref();
-    } else if (tls_data.num_blocks >= MAX_BLOCKS_PER_THREAD) {
+    } else if (tls_data.num_blocks >= max_blocks_per_thread()) {
         b->dec_ref();
         g_num_hit_tls_threshold.fetch_add(1, butil::memory_order_relaxed);
     } else {
-        b->portal_next = tls_data.block_head;
+        b->u.portal_next = tls_data.block_head;
         tls_data.block_head = b;
         ++tls_data.num_blocks;
         if (!tls_data.registered) {
@@ -415,10 +465,10 @@ inline void release_tls_block(IOBuf::Block *b) {
 void release_tls_block_chain(IOBuf::Block* b) {
     TLSData& tls_data = g_tls_data;
     size_t n = 0;
-    if (tls_data.num_blocks >= MAX_BLOCKS_PER_THREAD) {
+    if (tls_data.num_blocks >= max_blocks_per_thread()) {
         do {
             ++n;
-            IOBuf::Block* const saved_next = b->portal_next;
+            IOBuf::Block* const saved_next = b->u.portal_next;
             b->dec_ref();
             b = saved_next;
         } while (b);
@@ -430,13 +480,13 @@ void release_tls_block_chain(IOBuf::Block* b) {
     do {
         ++n;
         CHECK(!b->full());
-        if (b->portal_next == NULL) {
+        if (b->u.portal_next == NULL) {
             last_b = b;
             break;
         }
-        b = b->portal_next;
+        b = b->u.portal_next;
     } while (true);
-    last_b->portal_next = tls_data.block_head;
+    last_b->u.portal_next = tls_data.block_head;
     tls_data.block_head = first_b;
     tls_data.num_blocks += n;
     if (!tls_data.registered) {
@@ -453,7 +503,7 @@ IOBuf::Block* acquire_tls_block() {
         return create_block();
     }
     while (b->full()) {
-        IOBuf::Block* const saved_next = b->portal_next;
+        IOBuf::Block* const saved_next = b->u.portal_next;
         b->dec_ref();
         tls_data.block_head = saved_next;
         --tls_data.num_blocks;
@@ -462,9 +512,9 @@ IOBuf::Block* acquire_tls_block() {
             return create_block();
         }
     }
-    tls_data.block_head = b->portal_next;
+    tls_data.block_head = b->u.portal_next;
     --tls_data.num_blocks;
-    b->portal_next = NULL;
+    b->u.portal_next = NULL;
     return b;
 }
 
@@ -978,6 +1028,7 @@ ssize_t IOBuf::cut_into_SSL_channel(SSL* ssl, int* ssl_error) {
     }
     
     IOBuf::BlockRef const& r = _ref_at(0);
+    ERR_clear_error();
     const int nw = SSL_write(ssl, r.block->data + r.offset, r.length);
     if (nw > 0) {
         pop_front(nw);
@@ -1207,22 +1258,41 @@ int IOBuf::appendv(const const_iovec* vec, size_t n) {
     return 0;
 }
 
-int IOBuf::append_user_data(void* data, size_t size, void (*deleter)(void*)) {
+int IOBuf::append_user_data_with_meta(void* data,
+                                      size_t size,
+                                      std::function<void(void*)> deleter,
+                                      uint64_t meta) {
     if (size > 0xFFFFFFFFULL - 100) {
         LOG(FATAL) << "data_size=" << size << " is too large";
         return -1;
+    }
+    if (!deleter) {
+        deleter = ::free;
+    }
+    if (!size) {
+        deleter(data);
+        return 0;
     }
     char* mem = (char*)malloc(sizeof(IOBuf::Block) + sizeof(UserDataExtension));
     if (mem == NULL) {
         return -1;
     }
-    if (deleter == NULL) {
-        deleter = ::free;
-    }
-    IOBuf::Block* b = new (mem) IOBuf::Block((char*)data, size, deleter);
+    IOBuf::Block* b = new (mem) IOBuf::Block((char*)data, size, std::move(deleter));
+    b->u.data_meta = meta;
     const IOBuf::BlockRef r = { 0, b->cap, b };
     _move_back_ref(r);
     return 0;
+}
+
+uint64_t IOBuf::get_first_data_meta() {
+    if (_ref_num() == 0) {
+        return 0;
+    }
+    IOBuf::BlockRef const& r = _ref_at(0);
+    if (!(r.block->flags & IOBUF_BLOCK_FLAGS_USER_DATA)) {
+        return 0;
+    }
+    return r.block->u.data_meta;
 }
 
 int IOBuf::resize(size_t n, char c) {
@@ -1564,7 +1634,7 @@ ssize_t IOPortal::pappend_from_file_descriptor(
                 return -1;
             }
             if (prev_p != NULL) {
-                prev_p->portal_next = p;
+                prev_p->u.portal_next = p;
             } else {
                 _block = p;
             }
@@ -1577,7 +1647,7 @@ ssize_t IOPortal::pappend_from_file_descriptor(
             break;
         }
         prev_p = p;
-        p = p->portal_next;
+        p = p->u.portal_next;
     } while (1);
 
     ssize_t nr = 0;
@@ -1602,7 +1672,7 @@ ssize_t IOPortal::pappend_from_file_descriptor(
         _push_back_ref(r);
         _block->size += len;
         if (_block->full()) {
-            Block* const saved_next = _block->portal_next;
+            Block* const saved_next = _block->u.portal_next;
             _block->dec_ref();  // _block may be deleted
             _block = saved_next;
         }
@@ -1625,7 +1695,7 @@ ssize_t IOPortal::append_from_reader(IReader* reader, size_t max_count) {
                 return -1;
             }
             if (prev_p != NULL) {
-                prev_p->portal_next = p;
+                prev_p->u.portal_next = p;
             } else {
                 _block = p;
             }
@@ -1638,7 +1708,7 @@ ssize_t IOPortal::append_from_reader(IReader* reader, size_t max_count) {
             break;
         }
         prev_p = p;
-        p = p->portal_next;
+        p = p->u.portal_next;
     } while (1);
 
     const ssize_t nr = reader->ReadV(vec, nvec);
@@ -1657,7 +1727,7 @@ ssize_t IOPortal::append_from_reader(IReader* reader, size_t max_count) {
         _push_back_ref(r);
         _block->size += len;
         if (_block->full()) {
-            Block* const saved_next = _block->portal_next;
+            Block* const saved_next = _block->u.portal_next;
             _block->dec_ref();  // _block may be deleted
             _block = saved_next;
         }
@@ -1680,6 +1750,7 @@ ssize_t IOPortal::append_from_SSL_channel(
         }
 
         const size_t read_len = std::min(_block->left_space(), max_count - nr);
+        ERR_clear_error();
         const int rc = SSL_read(ssl, _block->data + _block->size, read_len);
         *ssl_error = SSL_get_error(ssl, rc);
         if (rc > 0) {
@@ -1687,7 +1758,7 @@ ssize_t IOPortal::append_from_SSL_channel(
             _push_back_ref(r);
             _block->size += rc;
             if (_block->full()) {
-                Block* const saved_next = _block->portal_next;
+                Block* const saved_next = _block->u.portal_next;
                 _block->dec_ref();  // _block may be deleted
                 _block = saved_next;
             }
@@ -2125,7 +2196,7 @@ bool IOBufBytesIterator::forward_one_block(const void** data, size_t* size) {
     return true;
 }
 
-}  // namespace butil
+} // namespace butil
 
 void* fast_memcpy(void *__restrict dest, const void *__restrict src, size_t n) {
     return butil::iobuf::cp(dest, src, n);

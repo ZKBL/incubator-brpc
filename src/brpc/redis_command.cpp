@@ -15,14 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <limits>
 
 #include "butil/logging.h"
 #include "brpc/log.h"
 #include "brpc/redis_command.h"
 
-namespace brpc {
+namespace {
 
 const size_t CTX_WIDTH = 5;
+
+} // namespace
+
+namespace brpc {
 
 // Much faster than snprintf(..., "%lu", d);
 inline size_t AppendDecimal(char* outbuf, unsigned long d) {
@@ -360,6 +365,10 @@ RedisCommandParser::RedisCommandParser()
     : _parsing_array(false)
     , _length(0)
     , _index(0) {}
+
+size_t RedisCommandParser::ParsedArgsSize() {
+    return _args.size();
+}
 
 ParseError RedisCommandParser::Consume(butil::IOBuf& buf,
                                        std::vector<butil::StringPiece>* args,

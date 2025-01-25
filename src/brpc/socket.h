@@ -38,6 +38,9 @@
 #include "brpc/socket_id.h"               // SocketId
 #include "brpc/socket_message.h"          // SocketMessagePtr
 #include "bvar/bvar.h"
+#include "brpc/http_method.h"
+#include "brpc/event_dispatcher.h"
+#include "brpc/versioned_ref_with_id.h"
 
 namespace brpc {
 namespace policy {
@@ -47,6 +50,10 @@ class H2GlobalStreamCreator;
 }  // namespace policy
 namespace schan {
 class ChannelBalancer;
+}
+namespace rdma {
+class RdmaEndpoint;
+class RdmaConnect;
 }
 
 class Socket;
@@ -60,7 +67,7 @@ class Stream;
 class SocketUser {
 public:
     virtual ~SocketUser() {}
-    virtual void BeforeRecycle(Socket*) {};
+    virtual void BeforeRecycle(Socket*) {}
 
     // Will be periodically called in a dedicated thread to check the
     // health.
@@ -153,51 +160,136 @@ struct PipelinedInfo {
     PipelinedInfo() { reset(); }
     void reset() {
         count = 0;
-        with_auth = false;
+        auth_flags = 0;
         id_wait = INVALID_BTHREAD_ID;
     }
     uint32_t count;
-    bool with_auth;
+    uint32_t auth_flags;
     bthread_id_t id_wait;
 };
+
+// A data structure packed with a pointer and
+// some extra information using a uint64 variable.
+template <class T>
+class PackedPtr {
+    static constexpr uint8_t MAX_POINTER_LEN = 48;
+    static constexpr uint64_t POINTER_MASK = ((uint64_t)1 << MAX_POINTER_LEN) - 1;
+    static constexpr uint64_t EXTRA_MASK = ~POINTER_MASK;
+public:
+    PackedPtr() : _data(0) {
+        BAIDU_CASSERT(sizeof(PackedPtr) == 8, sizeof_packed_ptr_must_be_8);
+    }
+
+    void set(T* ptr) {
+        // Clear the low 48 bits and then
+        // store the pointer in the low 48 bits.
+        _data = (_data & EXTRA_MASK) |
+                ((uint64_t)(uintptr_t)ptr & POINTER_MASK);
+    }
+
+    void reset() {
+        // Clear the low 48 bits.
+        _data &= EXTRA_MASK;
+    }
+
+    T* get() const { return (T*)(_data & POINTER_MASK); }
+
+    void set_extra(uint16_t extra) {
+        // Clear the high 16 bits and then
+        // store the extra in the high 16 bits.
+        _data = (_data & POINTER_MASK) |
+                ((uint64_t)extra << MAX_POINTER_LEN);
+    }
+
+    void reset_extra() {
+        // Clear the high 16 bits.
+        _data &= POINTER_MASK;
+    }
+
+    uint16_t extra() const { return _data >> MAX_POINTER_LEN; }
+
+    void set_ptr_and_extra(T* p, uint16_t extra) {
+        _data = ((uint64_t)(uintptr_t)p & POINTER_MASK) |
+                ((uint64_t)extra << MAX_POINTER_LEN);
+    }
+
+    void reset_ptr_and_extra() {
+        _data = 0;
+    }
+
+private:
+    // Pointer is stored in the low 48 bits,
+    // extra information is stored in the high 16 bits.
+    uint64_t _data;
+};
+
 
 struct SocketSSLContext {
     SocketSSLContext();
     ~SocketSSLContext();
 
-    SSL_CTX* raw_ctx;           // owned
-    std::string sni_name;       // useful for clients
+    SSL_CTX* raw_ctx;                        // owned
+    std::string sni_name;                    // useful for clients
+    std::vector<std::string> alpn_protocols; // useful for clients
+};
+
+struct SocketKeepaliveOptions {
+    // Start keeplives after this period.
+    int keepalive_idle_s{-1};
+    // Interval between keepalives.
+    int keepalive_interval_s{-1};
+    // Number of keepalives before death.
+    int keepalive_count{-1};
 };
 
 // TODO: Comment fields
 struct SocketOptions {
-    SocketOptions();
-
     // If `fd' is non-negative, set `fd' to be non-blocking and take the
     // ownership. Socket will close the fd(if needed) and call
     // user->BeforeRecycle() before recycling.
-    int fd;
+    int fd{-1};
     butil::EndPoint remote_side;
-    SocketUser* user;
+    // If `connect_on_create' is true and `fd' is less than 0,
+    // a client connection will be established to remote_side()
+    // regarding deadline `connect_abstime' when Socket is being created.
+    // Default: false, means that a connection will be established
+    // on first write.
+    bool connect_on_create{false};
+    // Default: NULL, means no timeout.
+    const timespec* connect_abstime{NULL};
+    SocketUser* user{NULL};
     // When *edge-triggered* events happen on the file descriptor, callback
     // `on_edge_triggered_events' will be called. Inside the callback, user
     // shall read fd() in non-blocking mode until all data has been read
     // or EAGAIN is met, otherwise the callback will not be called again
     // until new data arrives. The callback will not be called from more than
     // one thread at any time.
-    void (*on_edge_triggered_events)(Socket*);
-    int health_check_interval_s;
+    void (*on_edge_triggered_events)(Socket*){NULL};
+    int health_check_interval_s{-1};
+    // Only accept ssl connection.
+    bool force_ssl{false};
     std::shared_ptr<SocketSSLContext> initial_ssl_ctx;
-    bthread_keytable_pool_t* keytable_pool;
-    SocketConnection* conn;
+    bool use_rdma{false};
+    bthread_keytable_pool_t* keytable_pool{NULL};
+    SocketConnection* conn{NULL};
     std::shared_ptr<AppConnect> app_connect;
     // The created socket will set parsing_context with this value.
-    Destroyable* initial_parsing_context;
+    Destroyable* initial_parsing_context{NULL};
+
+    // Socket keepalive related options.
+    // Refer to `SocketKeepaliveOptions' for details.
+    std::shared_ptr<SocketKeepaliveOptions> keepalive_options;
+    // https://github.com/apache/brpc/issues/1154
+    // https://github.com/grpc/grpc/pull/16419/files
+    // Only linux supports TCP_USER_TIMEOUT.
+    int tcp_user_timeout_ms{ -1};
+    // Tag of this socket
+    bthread_tag_t bthread_tag{BTHREAD_TAG_DEFAULT};
 };
 
 // Abstractions on reading from and writing into file descriptors.
 // NOTE: accessed by multiple threads(frequently), align it by cacheline.
-class BAIDU_CACHELINE_ALIGNMENT/*note*/ Socket {
+class BAIDU_CACHELINE_ALIGNMENT/*note*/ Socket : public VersionedRefWithId<Socket> {
 friend class EventDispatcher;
 friend class InputMessenger;
 friend class Acceptor;
@@ -208,20 +300,24 @@ friend class Controller;
 friend class policy::ConsistentHashingLoadBalancer;
 friend class policy::RtmpContext;
 friend class schan::ChannelBalancer;
+friend class rdma::RdmaEndpoint;
+friend class rdma::RdmaConnect;
 friend class HealthCheckTask;
 friend class OnAppHealthCheckDone;
 friend class HealthCheckManager;
 friend class policy::H2GlobalStreamCreator;
+friend class VersionedRefWithId<Socket>;
+friend class IOEvent<Socket>;
+friend void DereferenceSocket(Socket*);
     class SharedPart;
-    struct Forbidden {};
     struct WriteRequest;
 
 public:
     const static int STREAM_FAKE_FD = INT_MAX;
     // NOTE: User cannot create Socket from constructor. Use Create()
     // instead. It's public just because of requirement of ResourcePool.
-    Socket(Forbidden);
-    ~Socket();
+    explicit Socket(Forbidden);
+    ~Socket() override;
 
     // Write `msg' into this Socket and clear it. The `msg' should be an
     // intact request or response. To prevent messages from interleaving
@@ -238,11 +334,18 @@ public:
     // - Write once when uncontended(most cases).
     // - Wait-free when contended.
     struct WriteOptions {
-        // `id_wait' is signalled when this Socket is SetFailed. To disable
-        // the signal, set this field to INVALID_BTHREAD_ID.
-        // `on_reset' of `id_wait' is NOT called when Write() returns non-zero.
+        // `id_wait' is signalled when this Socket is SetFailed or data is written
+        // successfully with `notify_on_success=true'. To disable the signal, set
+        // this field to INVALID_BTHREAD_ID. `on_reset' of `id_wait' is NOT called
+        // when Write() returns non-zero.
         // Default: INVALID_BTHREAD_ID
         bthread_id_t id_wait;
+
+        // If this field is set to true and `id_wait' is not INVALID_BTHREAD_ID,
+        // `id_wait' can be signalled when write successfully.
+        // Default: false
+        bool notify_on_success;
+
         // If no connection exists, a connection will be established to
         // remote_side() regarding deadline `abstime'. NULL means no timeout.
         // Default: NULL
@@ -256,17 +359,41 @@ public:
         // The request contains authenticating information which will be
         // responded by the server and processed specially when dealing
         // with the response.
-        bool with_auth;
+        uint32_t auth_flags;
 
         // Do not return EOVERCROWDED
         // Default: false
         bool ignore_eovercrowded;
 
+        // The calling thread directly creates KeepWrite thread to write into
+        // this socket, skipping writing once.
+        // In situations like when you are continually issuing lots of
+        // StreamWrite or async RPC calls in only one thread, directly creating
+        // KeepWrite thread at first provides batch write effect and better
+        // performance. Otherwise, each write only writes one `msg` into socket
+        // and no KeepWrite thread can be created, which brings poor
+        // performance.
+        // Default: false
+        bool write_in_background;
+
+        // After this write complete, shutdown write of the socket.
+        // Default: false
+        bool shutdown_write;
+
         WriteOptions()
-            : id_wait(INVALID_BTHREAD_ID), abstime(NULL)
-            , pipelined_count(0), with_auth(false)
-            , ignore_eovercrowded(false) {}
+            : id_wait(INVALID_BTHREAD_ID)
+            , notify_on_success(false)
+            , abstime(NULL)
+            , pipelined_count(0)
+            , auth_flags(0)
+            , ignore_eovercrowded(false)
+            , write_in_background(false)
+            , shutdown_write(false) {}
     };
+
+    // True if write of socket is shutdown.
+    bool IsWriteShutdown() const { return _is_write_shutdown; }
+
     int Write(butil::IOBuf *msg, const WriteOptions* options = NULL);
 
     // Write an user-defined message. `msg' is released when Write() is
@@ -282,12 +409,23 @@ public:
     // ip/port of the other end of the connection.
     butil::EndPoint remote_side() const { return _remote_side; }
 
-    // Positive value enables health checking.
     // Initialized by SocketOptions.health_check_interval_s.
     int health_check_interval() const { return _health_check_interval_s; }
 
-    // The unique identifier.
-    SocketId id() const { return _this_id; }
+    // True if health checking is enabled.
+    bool HCEnabled() const {
+        // This fence makes sure that we see change of
+        // `_is_hc_related_ref_held' before changing `_versioned_ref.
+        butil::atomic_thread_fence(butil::memory_order_acquire);
+        return _health_check_interval_s > 0 && _is_hc_related_ref_held;
+    }
+
+    // Release the health-checking-related
+    // reference which is held on created.
+    void ReleaseHCRelatedReference();
+
+    // After health checking is complete, set _hc_started to false.
+    void AfterHCCompleted() { _hc_started.store(false, butil::memory_order_relaxed); }
 
     // `user' parameter passed to Create().
     SocketUser* user() const { return _user; }
@@ -313,27 +451,12 @@ public:
     AuthContext* mutable_auth_context();
 
     // Create a Socket according to `options', put the identifier into `id'.
-    // Returns 0 on sucess, -1 otherwise.
+    // Returns 0 on success, -1 otherwise.
     static int Create(const SocketOptions& options, SocketId* id);
-
-    // Place the Socket associated with identifier `id' into unique_ptr `ptr',
-    // which will be released automatically when out of scope (w/o explicit
-    // std::move). User can still access `ptr' after calling ptr->SetFailed()
-    // before release of `ptr'.
-    // This function is wait-free.
-    // Returns 0 on success, -1 when the Socket was SetFailed().
-    static int Address(SocketId id, SocketUniquePtr* ptr);
-
-    // Re-address current socket into `ptr'.
-    // Always succeed even if this socket is failed.
-    void ReAddress(SocketUniquePtr* ptr);
-
-    // Returns 0 on success, 1 on failed socket, -1 on recycled.
-    static int AddressFailedAsWell(SocketId id, SocketUniquePtr* ptr);
 
     // Mark this Socket or the Socket associated with `id' as failed.
     // Any later Address() of the identifier shall return NULL unless the
-    // Socket was revivied by HealthCheckThread. The Socket is NOT recycled
+    // Socket was revivied by StartHealthCheck. The Socket is NOT recycled
     // after calling this function, instead it will be recycled when no one
     // references it. Internal fields of the Socket are still accessible
     // after calling this function. Calling SetFailed() of a Socket more
@@ -353,19 +476,10 @@ public:
 
     void FeedbackCircuitBreaker(int error_code, int64_t latency_us);
 
-    bool Failed() const;
-
-    bool DidReleaseAdditionalRereference() const
-    { return _recycle_flag.load(butil::memory_order_relaxed); }
-
     // Notify `id' object (by calling bthread_id_error) when this Socket
     // has been `SetFailed'. If it already has, notify `id' immediately
     void NotifyOnFailed(bthread_id_t id);
 
-    // Release the additional reference which added inside `Create'
-    // before so that `Socket' will be recycled automatically once
-    // on one is addressing it.
-    int ReleaseAdditionalReference();
     // `ReleaseAdditionalReference' this Socket iff it has no data
     // transmission during the last `idle_seconds'
     int ReleaseReferenceIfIdle(int idle_seconds);
@@ -381,8 +495,8 @@ public:
 
     // Start to process edge-triggered events from the fd.
     // This function does not block caller.
-    static int StartInputEvent(SocketId id, uint32_t events,
-                               const bthread_attr_t& thread_attr);
+    static int OnInputEvent(void* user_data, uint32_t events,
+                            const bthread_attr_t& thread_attr);
 
     static const int PROGRESS_INIT = 1;
     bool MoreReadEvents(int* progress);
@@ -520,22 +634,44 @@ public:
             _last_writetime_us.load(butil::memory_order_relaxed));
     }
 
-    // A brief description of this socket, consistent with os << *this
-    std::string description() const;
-
     // Returns true if the remote side is overcrowded.
     bool is_overcrowded() const { return _overcrowded; }
 
     bthread_keytable_pool_t* keytable_pool() const { return _keytable_pool; }
 
+    void set_http_request_method(const HttpMethod& method) { _http_request_method = method; }
+    HttpMethod http_request_method() const { return _http_request_method; }
+
 private:
     DISALLOW_COPY_AND_ASSIGN(Socket);
+
+    // The on/off state of RDMA
+    enum RdmaState {
+        RDMA_ON,
+        RDMA_OFF,
+        RDMA_UNKNOWN
+    };
 
     int ConductError(bthread_id_t);
     int StartWrite(WriteRequest*, const WriteOptions&);
 
-    int Dereference();
-friend void DereferenceSocket(Socket*);
+    // Create a Socket according to `options', put the identifier into `id'.
+    // Returns 0 on success, -1 otherwise.
+    int OnCreated(const SocketOptions& options);
+
+    // Called before returning to pool.
+    void BeforeRecycled();
+
+    void OnFailed(int error_code, const std::string& error_text);
+
+    // Make this socket addressable again.
+    void AfterRevived();
+
+    std::string OnDescription() const;
+
+    // Hold the health-checking-related
+    // reference on created.
+    void HoldHCRelatedRef();
 
     static int Status(SocketId, int32_t* nref = NULL);  // for unit-test.
 
@@ -557,9 +693,6 @@ friend void DereferenceSocket(Socket*);
     // success, -1 otherwise and errno is set
     ssize_t DoWrite(WriteRequest* req);
 
-    // Called before returning to pool.
-    void OnRecycle();
-
     // [Not thread-safe] Wait for EPOLLOUT event on `fd'. If `pollin' is
     // true, EPOLLIN event will also be included and EPOLL_CTL_MOD will
     // be used instead of EPOLL_CTL_ADD. Note that spurious wakeups may
@@ -573,8 +706,11 @@ friend void DereferenceSocket(Socket*);
     // starting a connection request and `on_connect' will be called
     // when connecting completes (whether it succeeds or not)
     // Returns the socket fd on success, -1 otherwise
+    int DoConnect(const timespec* abstime,
+                  int (*on_connect)(int fd, int err, void* data), void* data);
     int Connect(const timespec* abstime,
                 int (*on_connect)(int fd, int err, void* data), void* data);
+
     int CheckConnected(int sockfd);
 
     // [Not thread-safe] Only used by `Write'.
@@ -586,11 +722,10 @@ friend void DereferenceSocket(Socket*);
 
     int ResetFileDescriptor(int fd);
 
+    void SetSocketOptions(int fd);
+
     // Wait until nref hits `expected_nref' and reset some internal resources.
     int WaitAndReset(int32_t expected_nref);
-
-    // Make this socket addressable again.
-    void Revive();
 
     static void* ProcessEvent(void*);
 
@@ -606,8 +741,12 @@ friend void DereferenceSocket(Socket*);
         WriteRequest*, int error_code, const std::string& error_text);
     void ReleaseAllFailedWriteRequests(WriteRequest*);
 
-    // Generic callback for Socket to handle epollout event
-    static int HandleEpollOut(SocketId socket_id);
+    // Try to wake socket just like epollout has arrived
+    void WakeAsEpollOut();
+
+    // Generic callback for Socket to handle output event.
+    static int OnOutputEvent(void* user_data, uint32_t,
+                             const bthread_attr_t&);
 
     class EpollOutRequest;
     // Callback to handle epollout event whose request data
@@ -634,7 +773,7 @@ friend void DereferenceSocket(Socket*);
     // broken socket.
     int AddStream(StreamId stream_id);
     int RemoveStream(StreamId stream_id);
-    void ResetAllStreams();
+    void ResetAllStreams(int error_code, const std::string& error_text);
 
     bool ValidFileDescriptor(int fd);
 
@@ -662,16 +801,6 @@ friend void DereferenceSocket(Socket*);
     void CancelUnwrittenBytes(size_t bytes);
 
 private:
-    // unsigned 32-bit version + signed 32-bit referenced-count.
-    // Meaning of version:
-    // * Created version: no SetFailed() is called on the Socket yet. Must be
-    //   same evenness with initial _versioned_ref because during lifetime of
-    //   a Socket on the slot, the version is added with 1 twice. This is
-    //   also the version encoded in SocketId.
-    // * Failed version: = created version + 1, SetFailed()-ed but returned.
-    // * Other versions: the socket is already recycled.
-    butil::atomic<uint64_t> _versioned_ref;
-
     // In/Out bytes/messages, SocketPool etc
     // _shared_part is shared by a main socket and all its pooled sockets.
     // Can't use intrusive_ptr because the creation is based on optimistic
@@ -714,8 +843,7 @@ private:
     // Initialized by SocketOptions.app_connect.
     std::shared_ptr<AppConnect> _app_connect;
 
-    // Identifier of this Socket in ResourcePool
-    SocketId _this_id;
+    IOEvent<Socket> _io_event;
 
     // last chosen index of the protocol as a heuristic value to avoid
     // iterating all protocol handlers each time.
@@ -747,6 +875,15 @@ private:
     // Non-zero when health-checking is on.
     int _health_check_interval_s;
 
+    // The variable indicates whether the reference related
+    // to the health checking is held by someone. It can be
+    // synchronized via _versioned_ref atomic variable.
+    bool _is_hc_related_ref_held;
+
+    // Default: false.
+    // true, if health checking is started.
+    butil::atomic<bool> _hc_started;
+
     // +-1 bit-+---31 bit---+
     // |  flag |   counter  |
     // +-------+------------+
@@ -768,9 +905,19 @@ private:
     // exists in server side
     AuthContext* _auth_context;
 
+    // Only accept ssl connection.
+    bool _force_ssl;
     SSLState _ssl_state;
+    // SSL objects cannot be read and written at the same time.
+    // Use mutex to protect SSL objects when ssl_state is SSL_CONNECTED.
+    mutable butil::Mutex _ssl_session_mutex;
     SSL* _ssl_session;               // owner
     std::shared_ptr<SocketSSLContext> _ssl_ctx;
+
+    // The RdmaEndpoint
+    rdma::RdmaEndpoint* _rdma_ep;
+    // Should use RDMA or not
+    RdmaState _rdma_state;
 
     // Pass from controller, for progressive reading.
     ConnectionType _connection_type_for_progressive_read;
@@ -783,10 +930,6 @@ private:
 
     // Set by SetLogOff
     butil::atomic<bool> _logoff_flag;
-
-    // Flag used to mark whether additional reference has been decreased
-    // by either `SetFailed' or `SetRecycle'
-    butil::atomic<bool> _recycle_flag;
 
     // Concrete error information from SetFailed()
     // Accesses to these 2 fields(especially _error_text) must be protected
@@ -814,10 +957,29 @@ private:
     // Storing data that are not flushed into `fd' yet.
     butil::atomic<WriteRequest*> _write_head;
 
+    bool _is_write_shutdown;
+
     butil::Mutex _stream_mutex;
     std::set<StreamId> *_stream_set;
+    butil::atomic<int64_t> _total_streams_unconsumed_size;
 
     butil::atomic<int64_t> _ninflight_app_health_check;
+
+    // Socket keepalive related options.
+    // Refer to `SocketKeepaliveOptions' for details.
+    // non-NULL means that keepalive is on.
+    std::shared_ptr<SocketKeepaliveOptions> _keepalive_options;
+
+    // Only linux supports TCP_USER_TIMEOUT.
+    // When the value is greater than 0, it specifies the maximum
+    // amount of time in milliseconds that transmitted data may
+    // remain unacknowledged, or bufferred data may remain
+    // untransmitted (due to zero window size) before TCP will
+    // forcibly close the corresponding connection and return
+    // ETIMEDOUT to the application.
+    int _tcp_user_timeout_ms;
+
+    HttpMethod _http_request_method;
 };
 
 } // namespace brpc
