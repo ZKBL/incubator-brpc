@@ -381,12 +381,6 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
             break;
         }
 
-        if (socket->is_overcrowded()) {
-            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
-                            butil::endpoint2str(socket->remote_side()).c_str());
-            break;
-        }
-
         if (!server_accessor.AddConcurrency(cntl.get())) {
             cntl->SetFailed(
                 ELIMIT, "Reached server's max_concurrency=%d",
@@ -406,6 +400,13 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
                             meta.method().c_str());
             break;
         }
+        if (socket->is_overcrowded() &&
+            !server->options().ignore_eovercrowded &&
+            !sp->ignore_eovercrowded) {
+            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
+                            butil::endpoint2str(socket->remote_side()).c_str());
+            break;
+        }
         // Switch to service-specific error.
         non_service_error.release();
         method_status = sp->status;
@@ -420,6 +421,11 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
         google::protobuf::Service* svc = sp->service;
         const google::protobuf::MethodDescriptor* method = sp->method;
         accessor.set_method(method);
+
+        if (!server->AcceptRequest(cntl.get())) {
+            break;
+        }
+
         if (span) {
             span->ResetServerSpanName(method->full_name());
         }

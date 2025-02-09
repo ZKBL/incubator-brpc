@@ -167,7 +167,7 @@ bool HealthCheckTask::OnTriggeringTask(timespec* next_abstime) {
                  << " was abandoned before health checking";
         return false;
     }
-    // Note: Making a Socket re-addessable is hard. An alternative is
+    // Note: Making a Socket re-addressable is hard. An alternative is
     // creating another Socket with selected internal fields to replace
     // failed Socket. Although it avoids concurrent issues with in-place
     // revive, it changes SocketId: many code need to watch SocketId 
@@ -179,15 +179,17 @@ bool HealthCheckTask::OnTriggeringTask(timespec* next_abstime) {
     // one is addressing the Socket(except here). Because the Socket 
     // is not addressable, the reference count will not increase 
     // again. This solution is not perfect because the `expected_nref'
-    // is implementation specific. In our case, one reference comes 
-    // from SocketMapInsert(socket_map.cpp), one reference is here. 
-    // Although WaitAndReset() could hang when someone is addressing
-    // the failed Socket forever (also indicating bug), this is not an 
-    // issue in current code. 
+    // is implementation specific. In our case, one reference comes
+    // from someone who holds a reference related to health checking,
+    // e.g. SocketMapInsert(socket_map.cpp) or ChannelBalancer::AddChannel
+    // (selective_channel.cpp), one reference is here. Although WaitAndReset()
+    // could hang when someone is addressing the failed Socket forever
+    // (also indicating bug), this is not an issue in current code.
     if (_first_time) {  // Only check at first time.
         _first_time = false;
         if (ptr->WaitAndReset(2/*note*/) != 0) {
             LOG(INFO) << "Cancel checking " << *ptr;
+            ptr->AfterHCCompleted();
             return false;
         }
     }
@@ -204,22 +206,26 @@ bool HealthCheckTask::OnTriggeringTask(timespec* next_abstime) {
         hc = ptr->CheckHealth();
     }
     if (hc == 0) {
-        if (ptr->CreatedByConnect()) {
-            g_vars->channel_conn << -1;
-        }
         if (!FLAGS_health_check_path.empty()) {
             ptr->_ninflight_app_health_check.fetch_add(
                     1, butil::memory_order_relaxed);
         }
-        ptr->Revive();
+        // See comments above.
+        ptr->Revive(2/*note*/);
         ptr->_hc_count = 0;
         if (!FLAGS_health_check_path.empty()) {
             HealthCheckManager::StartCheck(_id, ptr->_health_check_interval_s);
         }
+        ptr->AfterHCCompleted();
         return false;
     } else if (hc == ESTOP) {
         LOG(INFO) << "Cancel checking " << *ptr;
+        ptr->AfterHCCompleted();
         return false;
+    } else {
+        RPC_VLOG << "Fail to check " << *ptr
+                 << ", error code=" << errno
+                 << ": " << berror();
     }
     ++ ptr->_hc_count;
     *next_abstime = butil::seconds_from_now(ptr->_health_check_interval_s);

@@ -38,8 +38,8 @@ brpc::Channel channel;
 namespace example {
 class CascadeEchoService : public EchoService {
 public:
-    CascadeEchoService() {};
-    virtual ~CascadeEchoService() {};
+    CascadeEchoService() {}
+    virtual ~CascadeEchoService() {}
     virtual void Echo(google::protobuf::RpcController* cntl_base,
                       const EchoRequest* request,
                       EchoResponse* response,
@@ -85,8 +85,8 @@ public:
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::SetUsageMessage("A server that may call itself");
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::SetUsageMessage("A server that may call itself");
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
 
     // A Channel represents a communication line to a Server. Notice that 
     // Channel is thread-safe and can be shared by all threads in your program.

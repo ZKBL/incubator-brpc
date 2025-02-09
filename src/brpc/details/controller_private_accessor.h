@@ -119,8 +119,8 @@ public:
         return _cntl->_remote_stream_settings;
     }
 
-    StreamId request_stream() { return _cntl->_request_stream; }
-    StreamId response_stream() { return _cntl->_response_stream; }
+    StreamIds request_streams() { return _cntl->_request_streams; }
+    StreamIds response_streams() { return _cntl->_response_streams; }
 
     void set_method(const google::protobuf::MethodDescriptor* method) 
     { _cntl->_method = method; }
@@ -128,13 +128,11 @@ public:
     void set_readable_progressive_attachment(ReadableProgressiveAttachment* s)
     { _cntl->_rpa.reset(s); }
 
-    void add_with_auth() {
-        _cntl->add_flag(Controller::FLAGS_REQUEST_WITH_AUTH);
+    void set_auth_flags(uint32_t auth_flags) {
+        _cntl->_auth_flags = auth_flags;
     }
 
-    void clear_with_auth() {
-        _cntl->clear_flag(Controller::FLAGS_REQUEST_WITH_AUTH);
-    }
+    void clear_auth_flags() { _cntl->_auth_flags = 0; }
 
     std::string& protocol_param() { return _cntl->protocol_param(); }
     const std::string& protocol_param() const { return _cntl->protocol_param(); }
